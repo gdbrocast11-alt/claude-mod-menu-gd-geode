@@ -1,0 +1,683 @@
+diff --git a/README.md b/README.md
+index c4ad123..47cc0d2 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,14 @@
++> **This is a modified version of Realistic Water, not the original mod.**
++> Original mod by **Skaffy**: https://github.com/sskaffy/Realistic-Water
++> Distributed under the original license (see `LICENSE`), with that notice kept intact.
++>
++> **What this fork changes (hardware compatibility):**
++> - Reads the GPU's real limits from Vulkan at startup and logs them.
++> - The pressure solver no longer requires 1024-thread workgroups: it uses the largest size the GPU supports (down to the Vulkan minimum of 128), and sizes the coarsest grid level to match.
++> - GPUs without subgroup arithmetic/ballot in compute shaders get a working fallback instead of failing to compile.
++> - Compiled shaders are cached on disk (`.minecraft/.cache/realistic-water/spirv`), and one shader compiler is reused, so later launches start faster.
++> - New `hardwareProfile` setting (`/water`, Performance): on `auto`, integrated GPUs and GPUs with under 3 GB of VRAM get lighter defaults (lower resolution, fewer substeps, simpler surface). Settings you changed yourself are never overridden; `full` turns this off.
++
+ # Realistic Water
+ A Minecraft mod that adds a lot of cool, realistic stuff from Minecraft Blender animations.
+ 
+diff --git a/src/client/java/me/skaffy/client/vk/GpuCaps.java b/src/client/java/me/skaffy/client/vk/GpuCaps.java
+new file mode 100644
+index 0000000..a5e0176
+--- /dev/null
++++ b/src/client/java/me/skaffy/client/vk/GpuCaps.java
+@@ -0,0 +1,119 @@
++package me.skaffy.client.vk;
++
++import me.skaffy.RealisticWater;
++import org.lwjgl.system.MemoryStack;
++import org.lwjgl.vulkan.VK10;
++import org.lwjgl.vulkan.VK11;
++import org.lwjgl.vulkan.VkPhysicalDevice;
++import org.lwjgl.vulkan.VkPhysicalDeviceLimits;
++import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
++import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
++import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
++import org.lwjgl.vulkan.VkPhysicalDeviceSubgroupProperties;
++
++/**
++ * What the GPU can actually do, read once from Vulkan.
++ *
++ * Fork addition: the original shaders assumed 1024-thread workgroups and full subgroup
++ * arithmetic support. Both are optional in Vulkan, so this probe lets shaders adapt.
++ */
++public final class GpuCaps {
++	private static final int NEEDED_SUBGROUP_OPS = VK11.VK_SUBGROUP_FEATURE_BASIC_BIT
++		| VK11.VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
++		| VK11.VK_SUBGROUP_FEATURE_BALLOT_BIT;
++
++	private static boolean probed;
++	private static String name = "unknown";
++	private static int deviceType = VK10.VK_PHYSICAL_DEVICE_TYPE_OTHER;
++	private static int maxInvocations = 128;
++	private static int maxGroupSizeX = 128;
++	private static int maxSharedBytes = 16384;
++	private static boolean subgroups;
++	private static long deviceLocalBytes;
++
++	private GpuCaps() {
++	}
++
++	private static synchronized void probe() {
++		if (probed) {
++			return;
++		}
++		probed = true;
++		try (MemoryStack stack = MemoryStack.stackPush()) {
++			VkPhysicalDevice phys = Vk.vk().getPhysicalDevice();
++
++			VkPhysicalDeviceSubgroupProperties sub = VkPhysicalDeviceSubgroupProperties.calloc(stack).sType$Default();
++			VkPhysicalDeviceProperties2 props2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(sub);
++			VK11.vkGetPhysicalDeviceProperties2(phys, props2);
++			VkPhysicalDeviceProperties props = props2.properties();
++			VkPhysicalDeviceLimits limits = props.limits();
++
++			name = props.deviceNameString();
++			deviceType = props.deviceType();
++			maxInvocations = limits.maxComputeWorkGroupInvocations();
++			maxGroupSizeX = limits.maxComputeWorkGroupSize(0);
++			maxSharedBytes = limits.maxComputeSharedMemorySize();
++			subgroups = (sub.supportedStages() & VK10.VK_SHADER_STAGE_COMPUTE_BIT) != 0
++				&& (sub.supportedOperations() & NEEDED_SUBGROUP_OPS) == NEEDED_SUBGROUP_OPS;
++
++			VkPhysicalDeviceMemoryProperties mem = VkPhysicalDeviceMemoryProperties.calloc(stack);
++			VK10.vkGetPhysicalDeviceMemoryProperties(phys, mem);
++			long best = 0L;
++			for (int i = 0; i < mem.memoryHeapCount(); i++) {
++				if ((mem.memoryHeaps(i).flags() & VK10.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
++					best = Math.max(best, mem.memoryHeaps(i).size());
++				}
++			}
++			deviceLocalBytes = best;
++		} catch (Throwable t) {
++			RealisticWater.LOGGER.warn("Realistic Water couldn't read GPU limits, using the safest settings", t);
++		}
++		RealisticWater.LOGGER.info("Realistic Water GPU: {} ({}), {} MiB VRAM, max workgroup {} (x {}), shared {} KiB, subgroup ops: {} -> large group {}",
++			name, typeName(), deviceLocalBytes >> 20, maxInvocations, maxGroupSizeX, maxSharedBytes >> 10, subgroups, largeGroup());
++	}
++
++	/** Largest power-of-two workgroup up to 1024 the device runs, never below the Vulkan minimum of 128. */
++	public static int largeGroup() {
++		probe();
++		int limit = Math.min(1024, Math.min(maxInvocations, maxGroupSizeX));
++		// The single-group solver keeps 3 arrays of this many 4-byte values in shared memory.
++		limit = Math.min(limit, Math.max(128, maxSharedBytes / 12));
++		int g = 128;
++		while (g * 2 <= limit) {
++			g *= 2;
++		}
++		return g;
++	}
++
++	/** True when compute shaders can use subgroup basic, arithmetic and ballot operations. */
++	public static boolean subgroups() {
++		probe();
++		return subgroups;
++	}
++
++	/** Integrated GPUs share system RAM and are usually much slower: used to pick lighter first-run defaults. */
++	public static boolean integrated() {
++		probe();
++		return deviceType == VK10.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || deviceType == VK10.VK_PHYSICAL_DEVICE_TYPE_CPU;
++	}
++
++	public static long deviceLocalBytes() {
++		probe();
++		return deviceLocalBytes;
++	}
++
++	public static String name() {
++		probe();
++		return name;
++	}
++
++	private static String typeName() {
++		return switch (deviceType) {
++			case VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU -> "discrete";
++			case VK10.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU -> "integrated";
++			case VK10.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU -> "virtual";
++			case VK10.VK_PHYSICAL_DEVICE_TYPE_CPU -> "software";
++			default -> "other";
++		};
++	}
++}
+diff --git a/src/client/java/me/skaffy/client/vk/Shaders.java b/src/client/java/me/skaffy/client/vk/Shaders.java
+index 0cdeab0..61732b7 100644
+--- a/src/client/java/me/skaffy/client/vk/Shaders.java
++++ b/src/client/java/me/skaffy/client/vk/Shaders.java
+@@ -5,9 +5,18 @@ import java.io.InputStream;
+ import java.nio.ByteBuffer;
+ import java.nio.LongBuffer;
+ import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
+ import java.util.HashSet;
++import java.util.HexFormat;
+ import java.util.Map;
+ import java.util.Set;
++import me.skaffy.RealisticWater;
++import net.fabricmc.loader.api.FabricLoader;
++import org.jspecify.annotations.Nullable;
+ import org.lwjgl.system.MemoryStack;
+ import org.lwjgl.system.MemoryUtil;
+ import org.lwjgl.util.shaderc.Shaderc;
+@@ -20,6 +29,27 @@ public final class Shaders {
+ 	public static final int FRAGMENT = Shaderc.shaderc_fragment_shader;
+ 	public static final int COMPUTE = Shaderc.shaderc_compute_shader;
+ 
++	/** Bump when the compile setup changes so stale cached SPIR-V is never reused. */
++	private static final String CACHE_VERSION = "rw-spv-1";
++
++	/**
++	 * Without subgroup support every invocation acts as its own one-lane subgroup. The mod only uses
++	 * subgroups to batch atomics (elect a leader, add the group total, broadcast the base), and that
++	 * pattern stays correct with one lane per group, it just issues more atomics.
++	 */
++	private static final String SUBGROUP_FALLBACK = String.join("\n",
++		"#define RW_NO_SUBGROUPS 1",
++		"#define subgroupAdd(v) (v)",
++		"#define subgroupExclusiveAdd(v) (0u * (v))",
++		"#define subgroupMin(v) (v)",
++		"#define subgroupMax(v) (v)",
++		"#define subgroupElect() true",
++		"#define subgroupBroadcastFirst(v) (v)",
++		"");
++
++	private static long compiler;
++	private static long options;
++
+ 	private Shaders() {
+ 	}
+ 
+@@ -34,7 +64,7 @@ public final class Shaders {
+ 		}
+ 	}
+ 
+-	private static String preprocess(String source, Set<String> seen) {
++	private static String preprocess(String source, Set<String> seen, boolean dropSubgroupExtensions) {
+ 		StringBuilder out = new StringBuilder();
+ 		for (String line : source.split("\n", -1)) {
+ 			String trimmed = line.trim();
+@@ -43,8 +73,10 @@ public final class Shaders {
+ 				int b = trimmed.lastIndexOf('"');
+ 				String file = trimmed.substring(a + 1, b);
+ 				if (seen.add(file)) {
+-					out.append(preprocess(load(file), seen)).append('\n');
++					out.append(preprocess(load(file), seen, dropSubgroupExtensions)).append('\n');
+ 				}
++			} else if (dropSubgroupExtensions && trimmed.startsWith("#extension GL_KHR_shader_subgroup")) {
++				out.append('\n');
+ 			} else {
+ 				out.append(line).append('\n');
+ 			}
+@@ -56,32 +88,129 @@ public final class Shaders {
+ 		String source = load(name);
+ 		int nl = source.indexOf('\n');
+ 		StringBuilder head = new StringBuilder(source.substring(0, nl + 1));
++		// Hardware-dependent sizes: see GpuCaps.
++		head.append("#define RW_LARGE_GROUP ").append(GpuCaps.largeGroup()).append('\n');
++		boolean fallback = !GpuCaps.subgroups();
++		if (fallback) {
++			head.append(SUBGROUP_FALLBACK);
++		}
+ 		defines.forEach((k, v) -> head.append("#define ").append(k).append(' ').append(v).append('\n'));
+-		String full = preprocess(head + source.substring(nl + 1), new HashSet<>());
++		String full = preprocess(head + source.substring(nl + 1), new HashSet<>(), fallback);
+ 
+-		long compiler = Shaderc.shaderc_compiler_initialize();
+-		long options = Shaderc.shaderc_compile_options_initialize();
+-		ByteBuffer src = MemoryUtil.memUTF8(full, false);
++		String key = cacheKey(full, kind);
++		ByteBuffer spv = key != null ? readCache(key) : null;
++		if (spv == null) {
++			spv = compile(name, full, kind);
++			if (key != null) {
++				writeCache(key, spv);
++			}
++		}
+ 		try (MemoryStack stack = MemoryStack.stackPush()) {
++			VkShaderModuleCreateInfo info = VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(spv);
++			LongBuffer pModule = stack.mallocLong(1);
++			Vk.check(VK10.vkCreateShaderModule(Vk.vk(), info, null, pModule), "vkCreateShaderModule " + name);
++			return pModule.get(0);
++		} finally {
++			MemoryUtil.memFree(spv);
++		}
++	}
++
++	/** Compiles to SPIR-V, returning a buffer from MemoryUtil.memAlloc that the caller frees. */
++	private static synchronized ByteBuffer compile(String name, String full, int kind) {
++		if (compiler == 0L) {
++			// One compiler for the whole session instead of one per shader: saves noticeable startup time.
++			compiler = Shaderc.shaderc_compiler_initialize();
++			options = Shaderc.shaderc_compile_options_initialize();
+ 			Shaderc.shaderc_compile_options_set_target_env(options, Shaderc.shaderc_target_env_vulkan, Shaderc.shaderc_env_version_vulkan_1_2);
+ 			Shaderc.shaderc_compile_options_set_optimization_level(options, Shaderc.shaderc_optimization_level_performance);
++		}
++		ByteBuffer src = MemoryUtil.memUTF8(full, false);
++		try (MemoryStack stack = MemoryStack.stackPush()) {
+ 			long result = Shaderc.shaderc_compile_into_spv(compiler, src, kind, stack.UTF8(name), stack.UTF8("main"), options);
+ 			try {
+ 				if (Shaderc.shaderc_result_get_compilation_status(result) != Shaderc.shaderc_compilation_status_success) {
+ 					throw new IllegalStateException("Shader " + name + " failed to compile:\n" + Shaderc.shaderc_result_get_error_message(result));
+ 				}
+-				ByteBuffer spv = Shaderc.shaderc_result_get_bytes(result);
+-				VkShaderModuleCreateInfo info = VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(spv);
+-				LongBuffer pModule = stack.mallocLong(1);
+-				Vk.check(VK10.vkCreateShaderModule(Vk.vk(), info, null, pModule), "vkCreateShaderModule " + name);
+-				return pModule.get(0);
++				ByteBuffer bytes = Shaderc.shaderc_result_get_bytes(result);
++				ByteBuffer copy = MemoryUtil.memAlloc(bytes.remaining());
++				copy.put(bytes).flip();
++				return copy;
+ 			} finally {
+ 				Shaderc.shaderc_result_release(result);
+ 			}
+ 		} finally {
+ 			MemoryUtil.memFree(src);
++		}
++	}
++
++	/** Frees the shared compiler once all shaders are built (they are rebuilt only after a reload). */
++	public static synchronized void releaseCompiler() {
++		if (compiler != 0L) {
+ 			Shaderc.shaderc_compile_options_release(options);
+ 			Shaderc.shaderc_compiler_release(compiler);
++			compiler = 0L;
++			options = 0L;
++		}
++	}
++
++	private static @Nullable Path cacheDir() {
++		try {
++			return FabricLoader.getInstance().getGameDir().resolve(".cache").resolve("realistic-water").resolve("spirv");
++		} catch (Throwable t) {
++			return null;
++		}
++	}
++
++	private static @Nullable String cacheKey(String full, int kind) {
++		try {
++			MessageDigest sha = MessageDigest.getInstance("SHA-256");
++			sha.update(CACHE_VERSION.getBytes(StandardCharsets.UTF_8));
++			sha.update((byte) kind);
++			sha.update(full.getBytes(StandardCharsets.UTF_8));
++			return HexFormat.of().formatHex(sha.digest());
++		} catch (NoSuchAlgorithmException e) {
++			return null;
++		}
++	}
++
++	private static @Nullable ByteBuffer readCache(String key) {
++		Path dir = cacheDir();
++		if (dir == null) {
++			return null;
++		}
++		Path file = dir.resolve(key + ".spv");
++		try {
++			if (!Files.isRegularFile(file)) {
++				return null;
++			}
++			byte[] data = Files.readAllBytes(file);
++			// SPIR-V is a stream of 32-bit words starting with the magic number 0x07230203.
++			if (data.length < 20 || data.length % 4 != 0 || data[0] != 0x03 || data[1] != 0x02 || data[2] != 0x23 || data[3] != 0x07) {
++				Files.deleteIfExists(file);
++				return null;
++			}
++			ByteBuffer buf = MemoryUtil.memAlloc(data.length);
++			buf.put(data).flip();
++			return buf;
++		} catch (IOException e) {
++			return null;
++		}
++	}
++
++	private static void writeCache(String key, ByteBuffer spv) {
++		Path dir = cacheDir();
++		if (dir == null) {
++			return;
++		}
++		try {
++			Files.createDirectories(dir);
++			byte[] data = new byte[spv.remaining()];
++			spv.duplicate().get(data);
++			Path tmp = Files.createTempFile(dir, key, ".tmp");
++			Files.write(tmp, data);
++			Files.move(tmp, dir.resolve(key + ".spv"), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
++		} catch (IOException | UnsupportedOperationException e) {
++			RealisticWater.LOGGER.debug("Couldn't cache shader {}", key, e);
+ 		}
+ 	}
+ }
+diff --git a/src/client/java/me/skaffy/client/water/PressureSolver.java b/src/client/java/me/skaffy/client/water/PressureSolver.java
+index 42592ce..70ea2ce 100644
+--- a/src/client/java/me/skaffy/client/water/PressureSolver.java
++++ b/src/client/java/me/skaffy/client/water/PressureSolver.java
+@@ -4,13 +4,17 @@ import java.util.ArrayList;
+ import java.util.List;
+ import me.skaffy.client.vk.ComputeProgram;
+ import me.skaffy.client.vk.Desc;
++import me.skaffy.client.vk.GpuCaps;
+ import me.skaffy.client.vk.Vk;
+ import me.skaffy.client.vk.VkBuf;
+ import org.lwjgl.vulkan.VkCommandBuffer;
+ 
+ final class PressureSolver implements AutoCloseable {
+ 	private static final int MAX_LEVELS = 14;
+-	private static final int COARSEST_CELLS = 512;
++	// The coarsest level is solved by one workgroup that holds every cell, so it must fit in one group.
++	private static int coarsestCells() {
++		return Math.min(512, GpuCaps.largeGroup());
++	}
+ 	private static final int RZ0 = 0;
+ 	private static final int PQ = 2;
+ 
+@@ -119,7 +123,7 @@ final class PressureSolver implements AutoCloseable {
+ 		List<int[]> dimList = new ArrayList<>();
+ 		int[] d = {nx, ny, nz};
+ 		dimList.add(d);
+-		while (dimList.size() < MAX_LEVELS && (long) d[0] * d[1] * d[2] > COARSEST_CELLS) {
++		while (dimList.size() < MAX_LEVELS && (long) d[0] * d[1] * d[2] > coarsestCells()) {
+ 			d = new int[]{(d[0] + 1) / 2, (d[1] + 1) / 2, (d[2] + 1) / 2};
+ 			dimList.add(d);
+ 		}
+diff --git a/src/client/java/me/skaffy/client/water/WaterSettings.java b/src/client/java/me/skaffy/client/water/WaterSettings.java
+index c5df1c9..9b4ac42 100644
+--- a/src/client/java/me/skaffy/client/water/WaterSettings.java
++++ b/src/client/java/me/skaffy/client/water/WaterSettings.java
+@@ -15,6 +15,9 @@ import java.util.Map;
+ import java.util.TreeMap;
+ 
+ public final class WaterSettings {
++	/** Fork addition: "auto" picks lighter defaults on integrated or low-VRAM GPUs, "full" keeps the original defaults, "low" forces the light ones. */
++	public static String hardwareProfile = "auto";
++
+ 	public static int resolution = 6;
+ 	public static int boxMargin = 6;
+ 
+@@ -335,6 +338,62 @@ public final class WaterSettings {
+ 	private WaterSettings() {
+ 	}
+ 
++	private static boolean profileApplied;
++
++	/**
++	 * Lighter defaults for weaker GPUs. Only settings the player never changed are touched, and the light value
++	 * becomes that setting's default, so it isn't written to the config file and "reset" returns to it.
++	 */
++	private static final Map<String, String> LOW_PROFILE = Map.ofEntries(
++		Map.entry("resolution", "4"),
++		Map.entry("lavaResolution", "4"),
++		Map.entry("sandResolution", "8"),
++		Map.entry("maxStepsPerFrame", "2"),
++		Map.entry("sandMaxStepsPerFrame", "8"),
++		Map.entry("surfaceSubdivision", "1"),
++		Map.entry("wwMaxPerParticle", "2"),
++		Map.entry("wwCellLimit", "6"),
++		Map.entry("sandGrainsPerParticle", "16"),
++		Map.entry("leavesPerBlock", "100"),
++		Map.entry("rainRadius", "20"),
++		Map.entry("kelpRadius", "32"),
++		Map.entry("packShadowDetail", "2"));
++
++	/** GPUs below this much device-local memory get the light profile in auto mode. */
++	private static final long LOW_VRAM_BYTES = 3L << 30;
++
++	/** Called once the Vulkan device exists, before any fluid region is created. */
++	public static void applyHardwareProfile(boolean integrated, long vramBytes, String gpuName) {
++		if (profileApplied) {
++			return;
++		}
++		profileApplied = true;
++		String mode = hardwareProfile.trim().toLowerCase();
++		boolean low = switch (mode) {
++			case "low" -> true;
++			case "full", "high", "off" -> false;
++			default -> integrated || (vramBytes > 0L && vramBytes < LOW_VRAM_BYTES);
++		};
++		if (!low) {
++			return;
++		}
++		int changed = 0;
++		for (Map.Entry<String, String> e : LOW_PROFILE.entrySet()) {
++			String name = e.getKey();
++			try {
++				if (get(name).equals(defaultValue(name))) {
++					set(name, e.getValue());
++					DEFAULTS.put(name, e.getValue());
++					changed++;
++				}
++			} catch (ReflectiveOperationException | NumberFormatException ex) {
++				RealisticWater.LOGGER.warn("Hardware profile couldn't set {}", name, ex);
++			}
++		}
++		RealisticWater.LOGGER.info("Realistic Water: using the light hardware profile for {} ({} settings lowered; set hardwareProfile=full to disable)",
++			gpuName, changed);
++	}
++
+ 	private static Map<String, String> snapshot() {
+ 		Map<String, String> out = new TreeMap<>();
+ 		for (Map.Entry<String, Field> e : fields().entrySet()) {
+diff --git a/src/client/java/me/skaffy/client/water/WaterSettingsInfo.java b/src/client/java/me/skaffy/client/water/WaterSettingsInfo.java
+index d6877bd..ca50fb7 100644
+--- a/src/client/java/me/skaffy/client/water/WaterSettingsInfo.java
++++ b/src/client/java/me/skaffy/client/water/WaterSettingsInfo.java
+@@ -94,6 +94,11 @@ public final class WaterSettingsInfo {
+ 	private static final String ONE_PASS = "Changes how much one compute pass does, not how many there are.";
+ 
+ 	static {
++		category("Performance");
++		text("hardwareProfile", "Hardware profile", Cost.EXTREME, "Takes effect on the next game start.",
++			"auto: lighter defaults on integrated GPUs or GPUs with under 3 GB of VRAM. full: always the original defaults. "
++				+ "low: always the lighter defaults. Settings you changed yourself are never overridden.");
++
+ 		category("Water simulation");
+ 		toggle("vanillaWaterExchange", "Mix with vanilla water", Cost.LOW, "Checks blocks where flowing vanilla water appears.",
+ 			"Realistic water that runs into still vanilla water (lakes, the sea) joins it, and flowing vanilla water that reaches "
+diff --git a/src/client/java/me/skaffy/client/water/WaterWorld.java b/src/client/java/me/skaffy/client/water/WaterWorld.java
+index c2a0823..cf4834e 100644
+--- a/src/client/java/me/skaffy/client/water/WaterWorld.java
++++ b/src/client/java/me/skaffy/client/water/WaterWorld.java
+@@ -24,6 +24,7 @@ import me.skaffy.block.RealisticSandBlock;
+ import me.skaffy.client.compat.FrameTarget;
+ import me.skaffy.client.compat.ShaderCompat;
+ import me.skaffy.client.vk.Desc;
++import me.skaffy.client.vk.GpuCaps;
+ import me.skaffy.client.vk.Vk;
+ import me.skaffy.client.vk.VkBuf;
+ import me.skaffy.client.vk.VkTex;
+@@ -414,6 +415,7 @@ public final class WaterWorld {
+ 
+ 	private boolean vulkanReady() {
+ 		if (Vk.tryDevice() != null) {
++			WaterSettings.applyHardwareProfile(GpuCaps.integrated(), GpuCaps.deviceLocalBytes(), GpuCaps.name());
+ 			return true;
+ 		}
+ 		Minecraft mc = Minecraft.getInstance();
+@@ -3059,6 +3061,7 @@ public final class WaterWorld {
+ 			this.frameView = null;
+ 		}
+ 		WaterRegion.closePrograms();
++		me.skaffy.client.vk.Shaders.releaseCompiler();
+ 		Vk.flushDeferredNow();
+ 	}
+ }
+diff --git a/src/client/resources/assets/realistic-water/shaders/mg_bottom.comp b/src/client/resources/assets/realistic-water/shaders/mg_bottom.comp
+index 6d3db0f..62311fd 100644
+--- a/src/client/resources/assets/realistic-water/shaders/mg_bottom.comp
++++ b/src/client/resources/assets/realistic-water/shaders/mg_bottom.comp
+@@ -1,6 +1,6 @@
+ #version 450
+ #include "common.glsl"
+-layout(local_size_x = 1024) in;
++layout(local_size_x = RW_LARGE_GROUP) in;
+ layout(std430, binding = 1) coherent buffer MgFlags { uint mgFlags[]; };
+ layout(std430, binding = 2) coherent buffer B0 { float b0[]; };
+ layout(std430, binding = 3) coherent buffer X0 { float x0[]; };
+diff --git a/src/client/resources/assets/realistic-water/shaders/mg_coarse.comp b/src/client/resources/assets/realistic-water/shaders/mg_coarse.comp
+index a3d86a2..9b1c15f 100644
+--- a/src/client/resources/assets/realistic-water/shaders/mg_coarse.comp
++++ b/src/client/resources/assets/realistic-water/shaders/mg_coarse.comp
+@@ -1,14 +1,14 @@
+ #version 450
+ #include "common.glsl"
+ #include "mg_common.glsl"
+-layout(local_size_x = 1024) in;
++layout(local_size_x = RW_LARGE_GROUP) in;
+ layout(std430, binding = 1) readonly buffer MgFlags { uint mgFlags[]; };
+ layout(std430, binding = 2) readonly buffer B { float b[]; };
+ layout(std430, binding = 3) buffer X { float x[]; };
+ 
+-shared float sx[1024];
+-shared float sb[1024];
+-shared uint sf[1024];
++shared float sx[RW_LARGE_GROUP];
++shared float sb[RW_LARGE_GROUP];
++shared uint sf[RW_LARGE_GROUP];
+ 
+ void sweep(int t, int count, ivec3 c, ivec3 lo, ivec3 size, int parity) {
+     if (t < count && sf[t] == CELL_FLUID && ((c.x + c.y + c.z) & 1) == parity) {
+@@ -39,7 +39,7 @@ void sweep(int t, int count, ivec3 c, ivec3 lo, ivec3 size, int parity) {
+ void main() {
+     int l = pc.misc.z;
+     int t = int(gl_LocalInvocationID.x);
+-    int count = min(lvlBoxCount(pc.dims, l), 1024);
++    int count = min(lvlBoxCount(pc.dims, l), RW_LARGE_GROUP);
+     ivec3 lo = lvlBoxMin(l);
+     ivec3 size = lvlBoxMax(l, pc.dims) - lo;
+     ivec3 c = ivec3(0);
+diff --git a/src/client/resources/assets/realistic-water/shaders/mg_inline.glsl b/src/client/resources/assets/realistic-water/shaders/mg_inline.glsl
+index badb00c..673491b 100644
+--- a/src/client/resources/assets/realistic-water/shaders/mg_inline.glsl
++++ b/src/client/resources/assets/realistic-water/shaders/mg_inline.glsl
+@@ -82,7 +82,7 @@ float applyA(ivec3 c, int i, ivec4 d, int l) {
+ void relax(int l, int parity, bool init) {
+     ivec4 d = levelDims(l);
+     int count = boxCount(d, l);
+-    for (int t = int(gl_LocalInvocationID.x); t < count; t += 1024) {
++    for (int t = int(gl_LocalInvocationID.x); t < count; t += RW_LARGE_GROUP) {
+         ivec3 c = boxCellOf(t, d, l);
+         int i = idx(c, d);
+         if (mgFlags[i] != CELL_FLUID) {
+@@ -123,7 +123,7 @@ void restrictTo(int l) {
+     ivec4 d = levelDims(l);
+     ivec4 cd = levelDims(l + 1);
+     int count = boxCount(cd, l + 1);
+-    for (int t = int(gl_LocalInvocationID.x); t < count; t += 1024) {
++    for (int t = int(gl_LocalInvocationID.x); t < count; t += RW_LARGE_GROUP) {
+         ivec3 C = boxCellOf(t, cd, l + 1);
+         int ci = idx(C, cd);
+         float sum = 0.0;
+@@ -150,7 +150,7 @@ void prolongFrom(int l) {
+     ivec4 d = levelDims(l);
+     ivec4 cd = levelDims(l + 1);
+     int count = boxCount(d, l);
+-    for (int t = int(gl_LocalInvocationID.x); t < count; t += 1024) {
++    for (int t = int(gl_LocalInvocationID.x); t < count; t += RW_LARGE_GROUP) {
+         ivec3 f = boxCellOf(t, d, l);
+         int fi = idx(f, d);
+         if (mgFlags[fi] != CELL_FLUID) {
+diff --git a/src/client/resources/assets/realistic-water/shaders/mg_solve_small.comp b/src/client/resources/assets/realistic-water/shaders/mg_solve_small.comp
+index 14eca17..8ec6fc6 100644
+--- a/src/client/resources/assets/realistic-water/shaders/mg_solve_small.comp
++++ b/src/client/resources/assets/realistic-water/shaders/mg_solve_small.comp
+@@ -1,6 +1,6 @@
+ #version 450
+ #include "common.glsl"
+-layout(local_size_x = 1024) in;
++layout(local_size_x = RW_LARGE_GROUP) in;
+ layout(std430, binding = 1) coherent buffer MgFlags { uint mgFlags[]; };
+ layout(std430, binding = 2) coherent buffer B0 { float b0[]; };
+ layout(std430, binding = 3) coherent buffer X0 { float x0[]; };
+@@ -15,13 +15,13 @@ layout(push_constant) uniform PC { ivec4 a; ivec4 b; } pc;
+ 
+ #include "mg_inline.glsl"
+ 
+-shared float partial[1024];
++shared float partial[RW_LARGE_GROUP];
+ 
+ float total(float v) {
+     uint lid = gl_LocalInvocationID.x;
+     partial[lid] = v;
+     barrier();
+-    for (uint s = 512u; s > 0u; s >>= 1) {
++    for (uint s = uint(RW_LARGE_GROUP) / 2u; s > 0u; s >>= 1) {
+         if (lid < s) {
+             partial[lid] += partial[lid + s];
+         }
+@@ -56,7 +56,7 @@ float applyTo(ivec3 c, int i, ivec4 d, bool useP) {
+ 
+ float dotRZ(ivec4 d, int count) {
+     float v = 0.0;
+-    for (int t = int(gl_LocalInvocationID.x); t < count; t += 1024) {
++    for (int t = int(gl_LocalInvocationID.x); t < count; t += RW_LARGE_GROUP) {
+         int i = idx(boxCellOf(t, d, 0), d);
+         v += b0[i] * x0[i];
+     }
+@@ -74,7 +74,7 @@ void main() {
+     int count = boxCount(d, 0);
+     int lid = int(gl_LocalInvocationID.x);
+ 
+-    for (int t = lid; t < count; t += 1024) {
++    for (int t = lid; t < count; t += RW_LARGE_GROUP) {
+         int i = idx(boxCellOf(t, d, 0), d);
+         mgFlags[i] = cellFlags[i] & 0xFFu;
+     }
+@@ -83,7 +83,7 @@ void main() {
+         ivec4 fd = levelDims(l);
+         ivec4 cd = levelDims(l + 1);
+         int coarseCount = boxCount(cd, l + 1);
+-        for (int t = lid; t < coarseCount; t += 1024) {
++        for (int t = lid; t < coarseCount; t += RW_LARGE_GROUP) {
+             ivec3 C = boxCellOf(t, cd, l + 1);
+             bool anyAir = false;
+             bool anyFluid = false;
+@@ -105,7 +105,7 @@ void main() {
+         sync();
+     }
+ 
+-    for (int t = lid; t < count; t += 1024) {
++    for (int t = lid; t < count; t += RW_LARGE_GROUP) {
+         ivec3 c = boxCellOf(t, d, 0);
+         int i = idx(c, d);
+         b0[i] = mgFlags[i] == CELL_FLUID ? div[i] - applyTo(c, i, d, false) : 0.0;
+@@ -113,7 +113,7 @@ void main() {
+     sync();
+     vcycleFrom(0, levels, pc.a.z);
+     float rz = dotRZ(d, count);
+-    for (int t = lid; t < count; t += 1024) {
++    for (int t = lid; t < count; t += RW_LARGE_GROUP) {
+         int i = idx(boxCellOf(t, d, 0), d);
+         p[i] = x0[i];
+     }
+@@ -122,7 +122,7 @@ void main() {
+     int iterations = max(pc.a.y, 1);
+     for (int k = 0; k < iterations; k++) {
+         float v = 0.0;
+-        for (int t = lid; t < count; t += 1024) {
++        for (int t = lid; t < count; t += RW_LARGE_GROUP) {
+             ivec3 c = boxCellOf(t, d, 0);
+             int i = idx(c, d);
+             if (mgFlags[i] == CELL_FLUID) {
+@@ -135,7 +135,7 @@ void main() {
+         }
+         float alpha = safeRatio(rz, total(v));
+         sync();
+-        for (int t = lid; t < count; t += 1024) {
++        for (int t = lid; t < count; t += RW_LARGE_GROUP) {
+             int i = idx(boxCellOf(t, d, 0), d);
+             pressure[i] += alpha * p[i];
+             b0[i] -= alpha * q[i];
+@@ -147,7 +147,7 @@ void main() {
+         vcycleFrom(0, levels, pc.a.z);
+         float next = dotRZ(d, count);
+         float beta = safeRatio(next, rz);
+-        for (int t = lid; t < count; t += 1024) {
++        for (int t = lid; t < count; t += RW_LARGE_GROUP) {
+             int i = idx(boxCellOf(t, d, 0), d);
+             p[i] = x0[i] + beta * p[i];
+         }
